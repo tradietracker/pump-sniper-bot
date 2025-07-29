@@ -40,16 +40,23 @@ alerted_tokens = load_alerted_tokens()
 # === UTILS ===
 def get_token_metadata(mint_address):
     try:
-        url = f"https://api.helius.xyz/v0/tokens/metadata?api-key={HELIUS_API_KEY}&mintAccounts[]={mint_address}"
+        url = f"https://api.helius.xyz/v0/token-metadata?api-key={HELIUS_API_KEY}&mint={mint_address}"
         response = requests.get(url, timeout=5)
         metadata = response.json()
-        if isinstance(metadata, list) and len(metadata) > 0:
-            name = metadata[0].get("name", "Unknown")
-            symbol = metadata[0].get("symbol", "")
-            return f"{name} (${symbol})" if symbol else name
+        name = metadata.get("name", None)
+        symbol = metadata.get("symbol", None)
+
+        if name and symbol:
+            return f"{name} (${symbol})"
+        elif name:
+            return name
+        elif symbol:
+            return f"${symbol}"
+        else:
+            return "Unknown Token"
     except Exception as e:
         print(f"[❌ Token metadata lookup failed]: {e}")
-    return mint_address
+        return "Unknown Token"
 
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
