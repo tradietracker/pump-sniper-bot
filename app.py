@@ -7,82 +7,75 @@ import requests
 app = Flask(__name__)
 
 # === ENV CONFIG ===
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-AXIOM_API_KEY = os.getenv("AXIOM_API_KEY")
-AXIOM_DATASET = "justamemecoin_trades"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8002496896:AAHVVGnUTP_d7Gpz_7nS7L9kNNr9SgcJ__0")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6558366634")
+AXIOM_DATASET = os.getenv("AXIOM_DATASET", "justamemecoin_trades")
+AXIOM_TOKEN = os.getenv("AXIOM_TOKEN", "axiom_ingest_key_here")
+AXIOM_URL = f"https://api.axiom.co/v1/datasets/{AXIOM_DATASET}/ingest"
 
-# === TELEGRAM SEND ===
-def send_telegram_alert(message):
+# === TELEGRAM ALERT ===
+def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        response = requests.post(url, json=payload)
-        if response.status_code == 200:
-            print("✅ Telegram alert sent")
-        else:
-            print("❌ Telegram error:", response.text)
+        res = requests.post(url, json=payload)
+        print(f"Telegram response: {res.status_code} - {res.text}")
     except Exception as e:
-        print("❌ Telegram exception:", str(e))
+        print("Telegram error:", e)
+
+# === AXIOM FORWARDING ===
+def forward_to_axiom(events):
+    try:
+        headers = {
+            "Authorization": f"Bearer {AXIOM_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        response = requests.post(AXIOM_URL, headers=headers, json=events)
+        print("[✅ Forwarded to Axiom]", response.status_code)
+        return response.status_code == 200
+    except Exception as e:
+        print("Axiom error:", e)
+        return False
 
 # === CSV FALLBACK ===
-def log_to_csv(event):
+def save_to_csv(events):
+    filename = "fallback_events.csv"
     try:
-        filename = "fallback_events.csv"
-        with open(filename, "a", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=event.keys())
-            if file.tell() == 0:
-                writer.writeheader()
-            writer.writerow(event)
+        with open(filename, mode="a", newline="") as file:
+            writer = csv.writer(file)
+            for event in events:
+                writer.writerow([datetime.now(timezone.utc).isoformat(), str(event)])
         print("[📝 Logged to CSV fallback]")
     except Exception as e:
         print("CSV logging error:", e)
 
-# === AXIOM FORWARD ===
-def forward_to_axiom(events):
-    url = f"https://api.axiom.co/v1/datasets/{AXIOM_DATASET}/ingest"
-    headers = {
-        "Authorization": f"Bearer {AXIOM_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    try:
-        response = requests.post(url, json=events, headers=headers)
-        print(f"[✅ Forwarded to Axiom] {response.status_code}")
-    except Exception as e:
-        print("[❌ Axiom Error]", str(e))
-
-# === ROUTES ===
-@app.route("/helfire", methods=["POST"])
-def webhook_handler():
+# === MAIN HELFIRE ENDPOINT ===
+@app.route('/helfire', methods=['POST'])
+def helfire():
     try:
         data = request.get_json()
         print("[🔥 Webhook Received]")
 
-        # Handle list or single dict
+        # Handle both dict and list style payloads
         events = data if isinstance(data, list) else [data]
 
         # Forward to Axiom
-        forward_to_axiom(events)
+        if not forward_to_axiom(events):
+            save_to_csv(events)
 
-        # Fallback log
+        # Example scoring logic
         for event in events:
-            log_to_csv(event)
-
-        # Telegram alert if score logic applies
-        for event in events:
-            if "pump_score" in event and event["pump_score"] >= 7:
-                msg = f"🚨 Pump Score Alert\n\nToken: {event.get('token_name', 'Unknown')}\nScore: {event['pump_score']}"
-                send_telegram_alert(msg)
+            pump_score = 7  # You’ll replace with real logic soon
+            if pump_score >= 7:
+                send_telegram_message(f"🚀 Pump Score {pump_score} detected for token!")
 
         return jsonify({"status": "ok"}), 200
     except Exception as e:
-        print("❌ Exception in webhook:", str(e))
-        return jsonify({"error": "Internal error"}), 500
+        print("Webhook error:", e)
+        return jsonify({"error": str(e)}), 500
 
-@app.route("/whoami", methods=["POST"])
+# === /whoami TEST ROUTE ===
+@app.route('/whoami', methods=['POST'])
 def whoami():
     data = request.get_json()
     print("[/whoami POST]", data)
@@ -95,6 +88,6 @@ def whoami():
         })
     return jsonify({"error": "Invalid data"})
 
-# === START ===
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+# === FLASK START ===
+if __name__ == '__main__':
+    app.run(debug=True)
