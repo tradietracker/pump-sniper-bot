@@ -1,147 +1,116 @@
 import os
 import csv
-import json
 from flask import Flask, request, jsonify
-import requests
 from datetime import datetime, timezone
+import requests
 
 app = Flask(__name__)
 
 # === CONFIG ===
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8002496896:AAHVVGnUTP_d7Gpz_7nS7L9kNNr9SgcJ__0"
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "6558366634"
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY") or "b7586bedae034d9bb58c5df3f4168b03"
+TELEGRAM_BOT_TOKEN = "8002496896:AAHVVGnUTP_d7Gpz_7nS7L9kNNr9SgcJ__0"
+TELEGRAM_CHAT_ID = "6558366634"
+AXIOM_API_KEY = "axiom-api-key-placeholder"
+AXIOM_INGEST_URL = "https://api.axiom.co/v1/datasets/justamemecoin_trades/ingest"
 
-CSV_LOG_PATH = "webhook_fallback_log.csv"
-active_gauges = {}
+# === TRACKING STATE ===
+active_gauges = {}  # {token_address: message_id}
+last_alerted_score = {}  # Prevent repeated alert spam
 
-# === UTILITIES ===
-def get_token_name(token_address: str) -> str:
+def get_token_name(mint_address):
     try:
-        url = f"https://mainnet.helius.xyz/v0/token-metadata?api-key={HELIUS_API_KEY}"
-        body = {"mintAccounts": [token_address]}
-        res = requests.post(url, json=body, timeout=10)
-        res.raise_for_status()
-        data = res.json()
-        if not data or not isinstance(data, list) or not data[0]:
-            return token_address
-        metadata = data[0].get("onChainMetadata", {}).get("metadata", {})
-        name = metadata.get("name")
-        return name if name else token_address
-    except Exception as e:
-        print(f"[Token Name Lookup Failed] {e}")
-        return token_address
+        url = f"https://mainnet.helius-rpc.com/?api-key=b7586bedae034d9bb58c5df3f4168b03"
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "name-check",
+            "method": "getAsset",
+            "params": { "id": mint_address }
+        }
+        response = requests.post(url, json=payload)
+        metadata = response.json().get("result", {})
+        return metadata.get("content", {}).get("metadata", {}).get("name", mint_address)
+    except:
+        return mint_address
 
-def send_telegram_message(text, reply_to_message_id=None):
+def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
+        "parse_mode": "Markdown"
     }
-    if reply_to_message_id:
-        payload["reply_to_message_id"] = reply_to_message_id
-    response = requests.post(url, json=payload)
-    print("Telegram response:", response.status_code, "-", response.text)
-    return response.json()
+    return requests.post(url, json=payload)
 
-def edit_telegram_message(message_id, text):
+def edit_telegram_message(message_id, new_text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "message_id": message_id,
-        "text": text,
-        "parse_mode": "Markdown",
+        "text": new_text,
+        "parse_mode": "Markdown"
     }
-    response = requests.post(url, json=payload)
-    print("Edit Telegram:", response.status_code, "-", response.text)
+    return requests.post(url, json=payload)
 
 def log_to_csv(data):
-    fieldnames = ["timestamp", "token_address", "pump_score"]
-    file_exists = os.path.exists(CSV_LOG_PATH)
-    with open(CSV_LOG_PATH, mode='a', newline='') as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(data)
-
-def format_gauge(score):
-    filled = "🟩" * score
-    empty = "⬜️" * (10 - score)
-    return f"{filled}{empty} ({score}/10)"
-
-# === ROUTES ===
-@app.route("/")
-def index():
-    return "Pump Sniper Bot is live"
+    with open("webhook_fallback_log.csv", "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([data.get("token_address"), data.get("pump_score"), data.get("timestamp")])
 
 @app.route("/helfire", methods=["POST"])
 def helfire():
+    data = request.get_json()
+
+    token = data.get("token_address")
+    score = int(data.get("pump_score"))
+    ts = data.get("timestamp", datetime.now(timezone.utc).isoformat())
+
+    # === LOG TO CSV IF AXIOM FAILS ===
     try:
-        data = request.get_json()
-        print("[🔥 Webhook Received]")
-        print(json.dumps(data, indent=2))
+        ax = requests.post(
+            AXIOM_INGEST_URL,
+            headers={"Authorization": f"Bearer {AXIOM_API_KEY}"},
+            json=[data]
+        )
+        if ax.status_code != 200:
+            log_to_csv(data)
+    except Exception:
+        log_to_csv(data)
 
-        token_address = data.get("token_address")
-        score = data.get("pump_score")
-        timestamp = data.get("timestamp")
+    # === Lookup Token Name ===
+    name = get_token_name(token)
 
-        if not token_address or score is None:
-            return jsonify({"error": "Missing token_address or pump_score"}), 400
+    # === ALERT ONLY ONCE ABOVE THRESHOLD ===
+    if score >= 7 and last_alerted_score.get(token) != score:
+        last_alerted_score[token] = score
+        strength_bar = "🟩" * score + "⬜️" * (10 - score)
+        text = f"""🚀 *Pump Score {score} detected!*
 
-        # Lookup token name
-        token_name = get_token_name(token_address)
+Token: `{token}`
+Name: *{name}*
+Pump Strength:
+{strength_bar} ({score}/10)
+_Live gauge updates will follow..._"""
+        res = send_telegram_message(text)
+        if res.status_code == 200:
+            message_id = res.json()["result"]["message_id"]
+            active_gauges[token] = message_id
+        return jsonify({"status": "alerted"})
 
-        # Prevent duplicate gauges
-        if token_address in active_gauges and score <= 3:
-            print(f"[❌ Gauge Ended for {token_address}]")
-            del active_gauges[token_address]
-            return jsonify({"status": "removed"}), 200
+    # === LIVE GAUGE UPDATE ===
+    if token in active_gauges:
+        if score <= 3:
+            edit_telegram_message(active_gauges[token], f"🔻 *Pump Score faded to {score}*\nToken: `{token}`\nNo longer tracking.")
+            del active_gauges[token]
+        else:
+            strength_bar = "🟩" * score + "⬜️" * (10 - score)
+            edit_telegram_message(active_gauges[token], f"""🚀 *Pump Score {score}!*
 
-        if token_address not in active_gauges and score >= 7:
-            # New alert
-            alert = f"🚀 *Pump Score {score} detected!*\n\n" \
-                    f"Token: `{token_address}`\n" \
-                    f"Name: *{token_name}*\n" \
-                    f"Pump Strength:\n{format_gauge(score)}\n" \
-                    f"_Live gauge updates will follow..._"
-            msg = send_telegram_message(alert)
-            active_gauges[token_address] = {
-                "message_id": msg["result"]["message_id"]
-            }
+Token: `{token}`
+Name: *{name}*
+Pump Strength:
+{strength_bar} ({score}/10)""")
+        return jsonify({"status": "updated"})
 
-        elif token_address in active_gauges:
-            # Gauge update
-            msg_id = active_gauges[token_address]["message_id"]
-            update = f"🚀 *Pump Score {score}!*\n\n" \
-                     f"Token: `{token_address}`\n" \
-                     f"Name: *{token_name}*\n" \
-                     f"Pump Strength:\n{format_gauge(score)}"
-            edit_telegram_message(msg_id, update)
+    return jsonify({"status": "ok"})
 
-        # Forward to Axiom (if needed)
-        try:
-            axiom_url = os.getenv("AXIOM_INGEST_URL")
-            if axiom_url:
-                res = requests.post(axiom_url, json=data, timeout=5)
-                if res.status_code != 200:
-                    raise Exception("Axiom error")
-                print("[✅ Forwarded to Axiom]", res.status_code)
-        except Exception as e:
-            print("[📝 Logged to CSV fallback]")
-            log_to_csv({
-                "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
-                "token_address": token_address,
-                "pump_score": score
-            })
-
-        return jsonify({"status": "ok"})
-
-    except Exception as e:
-        print("[❌ ERROR]", str(e))
-        return jsonify({"error": str(e)}), 500
-
-
-# === MAIN ===
 if __name__ == "__main__":
     app.run(debug=True)
