@@ -1,116 +1,136 @@
 import os
 import csv
+import requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone
-import requests
+from threading import Thread
+import time
 
 app = Flask(__name__)
 
 # === CONFIG ===
 TELEGRAM_BOT_TOKEN = "8002496896:AAHVVGnUTP_d7Gpz_7nS7L9kNNr9SgcJ__0"
-TELEGRAM_CHAT_ID = "6558366634"
-AXIOM_API_KEY = "axiom-api-key-placeholder"
-AXIOM_INGEST_URL = "https://api.axiom.co/v1/datasets/justamemecoin_trades/ingest"
+TELEGRAM_CHAT_ID = "-1002103841338"
+HELIUS_API_KEY = "b7586bedae034d9bb58c5df3f4168b03"
+ALERT_THRESHOLD = 7
+FADE_THRESHOLD = 3
+GAUGE_UPDATE_INTERVAL = 6  # seconds
 
-# === TRACKING STATE ===
-active_gauges = {}  # {token_address: message_id}
-last_alerted_score = {}  # Prevent repeated alert spam
+# === STATE ===
+active_gauges = {}  # token -> score
+last_alerted_scores = {}  # token -> last score sent
 
-def get_token_name(mint_address):
+
+def fetch_token_name(mint):
     try:
-        url = f"https://mainnet.helius-rpc.com/?api-key=b7586bedae034d9bb58c5df3f4168b03"
+        url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
         payload = {
             "jsonrpc": "2.0",
-            "id": "name-check",
-            "method": "getAsset",
-            "params": { "id": mint_address }
+            "id": "token-name-lookup",
+            "method": "getTokenMetadata",
+            "params": {
+                "mint": mint
+            }
         }
         response = requests.post(url, json=payload)
-        metadata = response.json().get("result", {})
-        return metadata.get("content", {}).get("metadata", {}).get("name", mint_address)
-    except:
-        return mint_address
+        result = response.json().get("result", {})
+        name = result.get("name")
+        if name and isinstance(name, str):
+            return name
+    except Exception as e:
+        print(f"[ERROR] Token name fetch failed for {mint}: {e}")
+    return mint  # fallback
+
+
+def build_pump_gauge(score):
+    return "🟩" * score + "⬜️" * (10 - score)
+
 
 def send_telegram_message(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    return requests.post(url, json=payload)
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown"
+        }
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"[ERROR] Telegram message failed: {e}")
 
-def edit_telegram_message(message_id, new_text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "message_id": message_id,
-        "text": new_text,
-        "parse_mode": "Markdown"
-    }
-    return requests.post(url, json=payload)
 
-def log_to_csv(data):
-    with open("webhook_fallback_log.csv", "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([data.get("token_address"), data.get("pump_score"), data.get("timestamp")])
+def edit_telegram_message(message_id, text):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"[ERROR] Telegram edit failed: {e}")
+
+
+def track_live_gauge(token, name, score, initial_message_id):
+    while True:
+        time.sleep(GAUGE_UPDATE_INTERVAL)
+        current_score = active_gauges.get(token, 0)
+        if current_score < FADE_THRESHOLD:
+            print(f"[INFO] Token {token} faded below threshold.")
+            active_gauges.pop(token, None)
+            break
+        gauge = build_pump_gauge(current_score)
+        text = (
+            f"📊 *Live Pump Score: {current_score}*\n\n"
+            f"Token: `{token}`\n"
+            f"Name: *{name}*\n"
+            f"{gauge} ({current_score}/10)"
+        )
+        edit_telegram_message(initial_message_id, text)
+
 
 @app.route("/helfire", methods=["POST"])
 def helfire():
     data = request.get_json()
-
     token = data.get("token_address")
-    score = int(data.get("pump_score"))
-    ts = data.get("timestamp", datetime.now(timezone.utc).isoformat())
+    score = int(data.get("pump_score", 0))
+    timestamp = data.get("timestamp", datetime.now(timezone.utc).isoformat())
 
-    # === LOG TO CSV IF AXIOM FAILS ===
-    try:
-        ax = requests.post(
-            AXIOM_INGEST_URL,
-            headers={"Authorization": f"Bearer {AXIOM_API_KEY}"},
-            json=[data]
+    if not token or score is None:
+        return jsonify({"error": "Missing token or score"}), 400
+
+    token_name = fetch_token_name(token)
+    print(f"[Webhook] {token_name} ({token}) → Score {score} at {timestamp}")
+
+    # Avoid repeat alerts
+    last_score = last_alerted_scores.get(token, 0)
+    if score >= ALERT_THRESHOLD and score > last_score:
+        last_alerted_scores[token] = score
+        gauge = build_pump_gauge(score)
+        text = (
+            f"🚀 *Pump Score {score} detected!*\n\n"
+            f"Token: `{token}`\n"
+            f"Name: *{token_name}*\n"
+            f"Pump Strength:\n{gauge} ({score}/10)\n"
+            f"_Live gauge updates will follow..._"
         )
-        if ax.status_code != 200:
-            log_to_csv(data)
-    except Exception:
-        log_to_csv(data)
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+        )
+        message_id = response.json().get("result", {}).get("message_id")
+        if message_id:
+            active_gauges[token] = score
+            Thread(target=track_live_gauge, args=(token, token_name, score, message_id)).start()
 
-    # === Lookup Token Name ===
-    name = get_token_name(token)
-
-    # === ALERT ONLY ONCE ABOVE THRESHOLD ===
-    if score >= 7 and last_alerted_score.get(token) != score:
-        last_alerted_score[token] = score
-        strength_bar = "🟩" * score + "⬜️" * (10 - score)
-        text = f"""🚀 *Pump Score {score} detected!*
-
-Token: `{token}`
-Name: *{name}*
-Pump Strength:
-{strength_bar} ({score}/10)
-_Live gauge updates will follow..._"""
-        res = send_telegram_message(text)
-        if res.status_code == 200:
-            message_id = res.json()["result"]["message_id"]
-            active_gauges[token] = message_id
-        return jsonify({"status": "alerted"})
-
-    # === LIVE GAUGE UPDATE ===
+    # Update score if already tracking
     if token in active_gauges:
-        if score <= 3:
-            edit_telegram_message(active_gauges[token], f"🔻 *Pump Score faded to {score}*\nToken: `{token}`\nNo longer tracking.")
-            del active_gauges[token]
-        else:
-            strength_bar = "🟩" * score + "⬜️" * (10 - score)
-            edit_telegram_message(active_gauges[token], f"""🚀 *Pump Score {score}!*
+        active_gauges[token] = score
 
-Token: `{token}`
-Name: *{name}*
-Pump Strength:
-{strength_bar} ({score}/10)""")
-        return jsonify({"status": "updated"})
+    return jsonify({"status": "ok"}), 200
 
-    return jsonify({"status": "ok"})
 
 if __name__ == "__main__":
     app.run(debug=True)
