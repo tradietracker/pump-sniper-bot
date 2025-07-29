@@ -1,5 +1,6 @@
 import os
 import csv
+import json
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone
@@ -12,14 +13,25 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 AXIOM_INGEST_URL = os.getenv("AXIOM_INGEST_URL")
 AXIOM_TOKEN = os.getenv("AXIOM_TOKEN")
 
-# === CONFIG ===
 PUMP_SCORE_THRESHOLD = 7
 FADE_SCORE_THRESHOLD = 3
 
-# === STATE TRACKING ===
-alerted_tokens = {}  # format: {token_address: {"message_id": 123, "last_score": 8}}
+ALERTED_FILE = "alerted_tokens.json"
 
-# === UTILITIES ===
+# === STATE ===
+def load_alerted_tokens():
+    if os.path.exists(ALERTED_FILE):
+        with open(ALERTED_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_alerted_tokens(data):
+    with open(ALERTED_FILE, "w") as f:
+        json.dump(data, f)
+
+alerted_tokens = load_alerted_tokens()
+
+# === UTILS ===
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     response = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
@@ -44,7 +56,6 @@ def forward_to_axiom(data):
     try:
         requests.post(AXIOM_INGEST_URL, json=data, headers=headers, timeout=5)
     except Exception:
-        # Fallback to CSV if Axiom fails
         log_to_csv(data.get("token_address", "unknown"), data.get("pump_score", 0), data.get("timestamp", "n/a"))
 
 def generate_gauge(score):
@@ -55,6 +66,8 @@ def generate_gauge(score):
 # === MAIN WEBHOOK ===
 @app.route("/helfire", methods=["POST"])
 def helfire():
+    global alerted_tokens
+
     data = request.json
     token = data.get("token_address")
     score = data.get("pump_score")
@@ -67,7 +80,10 @@ def helfire():
     log_to_csv(token, score, timestamp)
     forward_to_axiom(data)
 
-    # Case 1: New pump alert
+    # Reload alerts every request
+    alerted_tokens = load_alerted_tokens()
+
+    # === Case 1: New alert ===
     if token not in alerted_tokens and score >= PUMP_SCORE_THRESHOLD:
         text = (
             f"🚀 *Pump Score {score} detected!*\n\n"
@@ -80,13 +96,13 @@ def helfire():
 
         if message_id:
             alerted_tokens[token] = {"message_id": message_id, "last_score": score}
+            save_alerted_tokens(alerted_tokens)
 
-    # Case 2: Update existing gauge
+    # === Case 2: Edit gauge ===
     elif token in alerted_tokens:
         last_score = alerted_tokens[token]["last_score"]
         message_id = alerted_tokens[token]["message_id"]
 
-        # Update gauge only if score changed
         if score != last_score:
             new_text = (
                 f"🚀 *Pump Score {score}*\n\n"
@@ -95,9 +111,11 @@ def helfire():
             )
             edit_telegram_message(message_id, new_text)
             alerted_tokens[token]["last_score"] = score
+            save_alerted_tokens(alerted_tokens)
 
-        # If it fades below fade score, remove it from tracking
+        # === Case 3: Fade out ===
         if score <= FADE_SCORE_THRESHOLD:
             alerted_tokens.pop(token, None)
+            save_alerted_tokens(alerted_tokens)
 
     return jsonify({"status": "ok"}), 200
