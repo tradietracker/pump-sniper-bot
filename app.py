@@ -78,6 +78,8 @@ def handle_webhook():
         print(f"Webhook error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# === TEST ALERT ON STARTUP ===
-if __name__ == "__main__":
+# === SEND TELEGRAM ON STARTUP (RENDER-SAFE) ===
+@app.before_first_request
+def startup_alert():
     send_telegram_alert("✅ Telegram alert test successful from Pump Sniper Bot!")
+
