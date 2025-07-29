@@ -1,168 +1,103 @@
 import os
 import csv
+import requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone
-import requests
 
 app = Flask(__name__)
 
-# === ENV CONFIG ===
+# === ENV VARS ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 AXIOM_INGEST_URL = os.getenv("AXIOM_INGEST_URL")
-AXIOM_API_KEY = os.getenv("AXIOM_API_KEY")
+AXIOM_TOKEN = os.getenv("AXIOM_TOKEN")
 
-# === STATE ===
-alerted_tokens = set()
-live_gauges = {}
+# === CONFIG ===
+PUMP_SCORE_THRESHOLD = 7
+FADE_SCORE_THRESHOLD = 3
 
-# === CSV FALLBACK ===
-CSV_FILE = "fallback_log.csv"
-def log_to_csv(data):
-    try:
-        if isinstance(data, list):
-            for item in data:
-                with open(CSV_FILE, "a", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=item.keys())
-                    if f.tell() == 0:
-                        writer.writeheader()
-                    writer.writerow(item)
-        elif isinstance(data, dict):
-            with open(CSV_FILE, "a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=data.keys())
-                if f.tell() == 0:
-                    writer.writeheader()
-                writer.writerow(data)
-    except Exception as e:
-        print("CSV logging error:", str(e))
+# === STATE TRACKING ===
+alerted_tokens = {}  # format: {token_address: {"message_id": 123, "last_score": 8}}
 
-# === TELEGRAM ===
-def send_telegram(message):
+# === UTILITIES ===
+def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    requests.post(url, json=payload)
+    response = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    return response.json()
 
-def edit_telegram(message_id, new_text):
+def edit_telegram_message(message_id, new_text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-    payload = {
+    response = requests.post(url, json={
         "chat_id": TELEGRAM_CHAT_ID,
         "message_id": message_id,
-        "text": new_text,
-        "parse_mode": "Markdown"
-    }
-    requests.post(url, json=payload)
+        "text": new_text
+    })
+    return response.json()
 
-# === SCORING ===
-def calculate_pump_score(event):
+def log_to_csv(token_address, pump_score, timestamp):
+    with open("pump_score_log.csv", mode="a", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([timestamp, token_address, pump_score])
+
+def forward_to_axiom(data):
+    headers = {"Authorization": f"Bearer {AXIOM_TOKEN}"}
     try:
-        buy_volume = float(event.get("buy_volume", 0))
-        sell_volume = float(event.get("sell_volume", 0))
-        lp = float(event.get("liquidity", 0))
-        buys = int(event.get("buys", 0))
-        sells = int(event.get("sells", 0))
+        requests.post(AXIOM_INGEST_URL, json=data, headers=headers, timeout=5)
+    except Exception:
+        # Fallback to CSV if Axiom fails
+        log_to_csv(data.get("token_address", "unknown"), data.get("pump_score", 0), data.get("timestamp", "n/a"))
 
-        ratio = buy_volume / max(sell_volume, 1)
-        velocity = buys - sells
+def generate_gauge(score):
+    filled = "🟩" * score
+    empty = "⬜️" * (10 - score)
+    return f"{filled}{empty} ({score}/10)"
 
-        score = 0
-        if ratio > 1.5: score += 2
-        if buy_volume > 1000: score += 2
-        if lp > 3000: score += 1
-        if velocity > 3: score += 2
-        if buys > 10: score += 1
-
-        return round(score, 2)
-    except Exception as e:
-        print("Score error:", e)
-        return 0
-
-def format_alert(event, score):
-    return f"""🚀 *Pump Alert Detected!*
-*Token:* {event.get("token_name", "Unknown")}
-*Score:* {score}
-*Buys:* {event.get("buys")} | *Sells:* {event.get("sells")}
-*Buy Volume:* ${event.get("buy_volume")}
-*LP:* ${event.get("liquidity")}
-*Mint:* `{event.get("mint")}`
-"""
-
-def format_gauge(event, score):
-    return f"""📊 *Live Pump Score Tracker*
-*Token:* {event.get("token_name", "Unknown")}
-*Score:* {score}
-*Buys:* {event.get("buys")} | *Sells:* {event.get("sells")}
-*Buy Volume:* ${event.get("buy_volume")}
-*LP:* ${event.get("liquidity")}
-"""
-
-# === ROUTES ===
-@app.route('/helfire', methods=['POST'])
+# === MAIN WEBHOOK ===
+@app.route("/helfire", methods=["POST"])
 def helfire():
-    data = request.get_json()
-    print("[🔥 Webhook Received]")
+    data = request.json
+    token = data.get("token_address")
+    score = data.get("pump_score")
+    timestamp = data.get("timestamp", datetime.now(timezone.utc).isoformat())
 
-    if not data:
-        return jsonify({"error": "No data"}), 400
+    if token is None or score is None:
+        return jsonify({"error": "Missing token_address or pump_score"}), 400
 
-    try:
-        if isinstance(data, list):
-            events = data
-        else:
-            events = [data]
+    score = int(score)
+    log_to_csv(token, score, timestamp)
+    forward_to_axiom(data)
 
-        for event in events:
-            mint = event.get("mint")
-            score = calculate_pump_score(event)
+    # Case 1: New pump alert
+    if token not in alerted_tokens and score >= PUMP_SCORE_THRESHOLD:
+        text = (
+            f"🚀 *Pump Score {score} detected!*\n\n"
+            f"Token: `{token}`\n"
+            f"Pump Strength:\n{generate_gauge(score)}\n"
+            f"_Live gauge updates will follow..._"
+        )
+        sent = send_telegram_message(text)
+        message_id = sent.get("result", {}).get("message_id")
 
-            # Alert once per token
-            if mint not in alerted_tokens and score >= 7:
-                message = format_alert(event, score)
-                res = requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                    json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-                )
-                alerted_tokens.add(mint)
+        if message_id:
+            alerted_tokens[token] = {"message_id": message_id, "last_score": score}
 
-                # Start gauge
-                msg_id = res.json().get("result", {}).get("message_id")
-                if msg_id:
-                    live_gauges[mint] = msg_id
+    # Case 2: Update existing gauge
+    elif token in alerted_tokens:
+        last_score = alerted_tokens[token]["last_score"]
+        message_id = alerted_tokens[token]["message_id"]
 
-            # Gauge live updates
-            if mint in live_gauges:
-                if score < 3:
-                    # Stop tracking
-                    del live_gauges[mint]
-                else:
-                    edit_telegram(live_gauges[mint], format_gauge(event, score))
-
-        # Forward to Axiom
-        try:
-            axiom_res = requests.post(
-                AXIOM_INGEST_URL,
-                headers={"Authorization": f"Bearer {AXIOM_API_KEY}", "Content-Type": "application/json"},
-                json=events
+        # Update gauge only if score changed
+        if score != last_score:
+            new_text = (
+                f"🚀 *Pump Score {score}*\n\n"
+                f"Token: `{token}`\n"
+                f"Pump Strength:\n{generate_gauge(score)}"
             )
-            print("[✅ Forwarded to Axiom]", axiom_res.status_code)
-        except Exception as e:
-            log_to_csv(events)
+            edit_telegram_message(message_id, new_text)
+            alerted_tokens[token]["last_score"] = score
 
-        return jsonify({"status": "ok"}), 200
+        # If it fades below fade score, remove it from tracking
+        if score <= FADE_SCORE_THRESHOLD:
+            alerted_tokens.pop(token, None)
 
-    except Exception as e:
-        print("Processing error:", e)
-        log_to_csv(data)
-        return jsonify({"error": "processing error"}), 500
-
-@app.route('/whoami', methods=['POST'])
-def whoami():
-    data = request.get_json()
-    if "message" in data:
-        chat_id = data["message"]["chat"]["id"]
-        username = data["message"]["from"].get("username", "no_username")
-        return jsonify({"chat_id": chat_id, "username": username})
-    return jsonify({"error": "Invalid data"})
+    return jsonify({"status": "ok"}), 200
