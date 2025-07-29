@@ -1,61 +1,83 @@
-from flask import Flask, request, jsonify
-import requests
 import os
 import csv
-from datetime import datetime
+from flask import Flask, request, jsonify
+from datetime import datetime, timezone
+import requests
 
 app = Flask(__name__)
 
-AXIOM_API_KEY = os.getenv("AXIOM_API_KEY")
+# === ENV CONFIG ===
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 AXIOM_INGEST_URL = os.getenv("AXIOM_INGEST_URL")
-CSV_LOG_FILE = "webhook_fallback_log.csv"
+AXIOM_API_KEY = os.getenv("AXIOM_API_KEY")
 
-@app.route("/", methods=["GET"])
-def homepage():
-    return "✅ Pump Sniper Bot Webhook is live", 200
+# === TELEGRAM ALERT ===
+def send_telegram_alert(message: str):
+    try:
+        telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        response = requests.post(telegram_url, json=payload)
+        print(f"Telegram response: {response.status_code}")
+    except Exception as e:
+        print(f"Telegram error: {e}")
 
-@app.route('/helfire', methods=['POST'])
-def handle_helfire():
-    data = request.get_json()
-    print("[🔥 Webhook Received]")
-    print(data)
+# === CSV FALLBACK ===
+def log_to_csv(data):
+    try:
+        with open("webhook_fallback.csv", mode="a", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(data)
+    except Exception as e:
+        print(f"CSV log error: {e}")
 
-    # Always log to CSV as backup
-    log_to_csv(data)
+# === WEBHOOK ENDPOINT ===
+@app.route("/helfire", methods=["POST"])
+def handle_webhook():
+    try:
+        json_data = request.get_json()
 
-    # Try forwarding to Axiom
-    if AXIOM_API_KEY and AXIOM_INGEST_URL:
-        try:
+        # Extract trade data
+        price = json_data.get("price", 0)
+        amount = json_data.get("amount", 0)
+        symbol = json_data.get("symbol", "UNKNOWN")
+        side = json_data.get("side", "unknown")
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        # === Send to Axiom
+        if AXIOM_INGEST_URL and AXIOM_API_KEY:
             headers = {
                 "Authorization": f"Bearer {AXIOM_API_KEY}",
                 "Content-Type": "application/json"
             }
-            resp = requests.post(AXIOM_INGEST_URL, headers=headers, json=data)
-            print("[✅ Forwarded to Axiom]", resp.status_code)
-        except Exception as e:
-            print("[❌ Axiom Forward Error]", str(e))
+            axiom_payload = {
+                "_time": timestamp,
+                "price": price,
+                "amount": amount,
+                "symbol": symbol,
+                "side": side
+            }
+            axiom_response = requests.post(
+                AXIOM_INGEST_URL, headers=headers, json=axiom_payload
+            )
 
-    return jsonify({"status": "received"}), 200
+            if axiom_response.status_code != 200:
+                print("Axiom ingest failed, logging to CSV.")
+                log_to_csv([timestamp, symbol, price, amount, side])
+        else:
+            print("Axiom credentials not set, logging to CSV.")
+            log_to_csv([timestamp, symbol, price, amount, side])
 
-def log_to_csv(data):
-    try:
-        file_exists = os.path.isfile(CSV_LOG_FILE)
-        with open(CSV_LOG_FILE, mode='a', newline='', encoding='utf-8') as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=['timestamp', 'token', 'price', 'volume', 'source'])
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow({
-                'timestamp': datetime.utcnow().isoformat(),
-                'token': data.get('token'),
-                'price': data.get('price'),
-                'volume': data.get('volume'),
-                'source': data.get('source', 'unknown')
-            })
-            print("[📝 Logged to CSV]")
+        return jsonify({"status": "ok"}), 200
+
     except Exception as e:
-        print("[⚠️ CSV Log Error]", str(e))
+        print(f"Webhook error: {e}")
+        return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
+# === TEST ALERT ON STARTUP ===
+if __name__ == "__main__":
+    send_telegram_alert("✅ Telegram alert test successful from Pump Sniper Bot!")
