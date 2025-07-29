@@ -1,74 +1,87 @@
 import os
 import csv
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 app = Flask(__name__)
-CORS(app)
 
-# === ENV CONFIG ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-AXIOM_API_KEY = os.getenv("AXIOM_API_KEY")
 AXIOM_INGEST_URL = os.getenv("AXIOM_INGEST_URL")
+CSV_FALLBACK_FILE = "webhook_fallback.csv"
 
-# === HELPERS ===
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+def send_telegram_alert(message):
+    telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
+        "text": message
     }
-    try:
-        res = requests.post(url, json=payload)
-        print(f"[Telegram Response] Status: {res.status_code}, Body: {res.text}")
-        return res.status_code == 200
-    except Exception as e:
-        print(f"[Telegram Error] {e}")
-        return False
+    response = requests.post(telegram_url, json=payload)
+    print("[Telegram Response]", response.status_code, response.text)
+    return response.status_code == 200
 
-def log_to_csv(event):
-    try:
-        timestamp = datetime.utcnow().isoformat()
-        with open("webhook_log.csv", "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([timestamp, event])
-    except Exception as e:
-        print(f"[⚠️ CSV Log Error] {e}")
+@app.route("/")
+def home():
+    return "Pump Sniper Bot is live!"
 
-# === ROUTES ===
-@app.route("/helfire", methods=["POST"])
-def helfire():
-    event = request.json
-    print("[🔥 Webhook Received]")
-
-    # Log to Axiom if available
-    if AXIOM_API_KEY and AXIOM_INGEST_URL:
-        try:
-            res = requests.post(
-                AXIOM_INGEST_URL,
-                json=event,
-                headers={"Authorization": f"Bearer {AXIOM_API_KEY}"}
-            )
-            print(f"[✅ Forwarded to Axiom] {res.status_code}")
-        except Exception as e:
-            print(f"[⚠️ Axiom Error] {e}")
-
-    # Fallback log to CSV
-    try:
-        log_to_csv(event)
-    except Exception as e:
-        print(f"[⚠️ CSV Logging Failed] {e}")
-
-    return jsonify({"received": True})
-
-@app.route("/test-alert", methods=["GET"])
+@app.route("/test-alert")
 def test_alert():
-    success = send_telegram_message("✅ Manual test alert from Pump Sniper Bot (via /test-alert)")
-    return jsonify({"sent": success})
+    sent = send_telegram_alert("🚀 Test alert from Pump Sniper Bot is working!")
+    return jsonify({"sent": sent})
+
+@app.route(f"/{os.getenv('WEBHOOK_PATH', 'helfire')}", methods=["POST"])
+def handle_webhook():
+    try:
+        data = request.get_json()
+        print("[🔥 Webhook Received]")
+        if isinstance(data, list):
+            for item in data:
+                process_event(item)
+        else:
+            process_event(data)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        print("[Webhook Error]", str(e))
+        return jsonify({"error": str(e)}), 500
+
+def process_event(event):
+    try:
+        # Log to Axiom
+        if AXIOM_INGEST_URL:
+            axiom_resp = requests.post(AXIOM_INGEST_URL, json=event)
+            print("[✅ Forwarded to Axiom]", axiom_resp.status_code)
+
+        # Log to CSV fallback
+        with open(CSV_FALLBACK_FILE, mode="a", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                datetime.now(timezone.utc).isoformat(),
+                event.get("description", ""),
+                event.get("amount", ""),
+                event.get("source", ""),
+                event.get("destination", ""),
+                event.get("signature", "")
+            ])
+    except Exception as e:
+        print("[⚠️ CSV Log Error]", str(e))
+
+# === Telegram Bot Handler ===
+@app.route("/start-bot", methods=["POST"])
+def handle_start():
+    data = request.get_json()
+    message = data.get("message", {}).get("text", "")
+    chat_id = data.get("message", {}).get("chat", {}).get("id")
+
+    if message == "/start":
+        telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": "👋 Hey! Pump Sniper Bot is now active in this chat."
+        }
+        resp = requests.post(telegram_url, json=payload)
+        return jsonify({"status": "replied", "telegram_response": resp.text})
+    return jsonify({"status": "ignored"})
 
 if __name__ == "__main__":
     app.run(debug=True)
