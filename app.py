@@ -7,6 +7,10 @@ app = Flask(__name__)
 AXIOM_API_KEY = os.getenv("AXIOM_API_KEY")
 AXIOM_INGEST_URL = os.getenv("AXIOM_INGEST_URL")
 
+@app.route('/', methods=['GET'])
+def index():
+    return "✅ Pump Sniper Bot Webhook is live and ready!", 200
+
 @app.route('/helfire', methods=['POST'])
 def handle_helfire():
     data = request.get_json()
