@@ -8,8 +8,8 @@ app = Flask(__name__)
 
 # === CONFIG ===
 TELEGRAM_BOT_TOKEN = "8002496896:AAHVVGnUTP_d7Gpz_7nS7L9kNNr9SgcJ__0"
-TELEGRAM_CHAT_ID = "-1002125092947"
-HELIUS_API_KEY = "b7586bedae034d9bb58c5df3f4168b03"  # Your updated key here
+TELEGRAM_CHAT_ID = "-6558366634"
+HELIUS_API_KEY = "e61c01b8-8e60-4c29-8144-559953796a62"  # Your updated key here
 ALERTED_TOKENS = {}
 
 # === UTILS ===
