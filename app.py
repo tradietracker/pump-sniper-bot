@@ -36,7 +36,7 @@ def build_pump_gauge(score):
     return f"{filled}{empty} ({score}/10)"
 
 def send_telegram_alert(token_address, token_name, pump_score):
-    """Send the initial pump alert to Telegram."""
+    """Send a formatted pump alert message to Telegram."""
     gauge_blocks = build_pump_gauge(pump_score)
     message = f"""
 🚀 *Pump Score {pump_score} detected!*
@@ -52,23 +52,8 @@ _Live gauge updates will follow..._
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
-            "parse_mode": "Markdown",
+            "parse_mode": "Markdown"
         }
-        response = requests.post(url, json=payload, timeout=5)
-        response.raise_for_status()
-    except Exception as e:
-        print(f"[Telegram Error] {e}")
-
-def send_gauge_update(token_address, pump_score):
-    """Send live gauge updates to Telegram."""
-    gauge_message = build_pump_gauge(pump_score)
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": gauge_message,
-        "parse_mode": "Markdown",
-    }
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         response = requests.post(url, json=payload, timeout=5)
         response.raise_for_status()
     except Exception as e:
@@ -97,7 +82,7 @@ def helfire():
             events = [payload]
 
         for data in events:
-            # If we didn’t get a dictionary, skip this event
+            # Skip if data is not a dictionary
             if not isinstance(data, dict):
                 continue
 
@@ -105,18 +90,23 @@ def helfire():
             score = data.get("pump_score")
             timestamp = data.get("timestamp") or datetime.utcnow().isoformat()
 
+            # Validate token and score
             if not token or not isinstance(score, int):
-                continue  # skip invalid entries
+                continue
 
+            # Ignore scores below threshold
             if score < 7:
-                continue  # ignore below-threshold scores
+                continue
 
+            # Skip if already alerted at an equal or higher score
             if token in alerted_tokens and alerted_tokens[token] >= score:
-                continue  # skip duplicate/lower alerts
+                continue
 
+            # Look up token name and send alert
             token_name = get_token_name(token)
             send_telegram_alert(token, token_name, score)
 
+            # Track and log
             alerted_tokens[token] = score
             log_to_csv([token, token_name, score, timestamp])
             print(f"[Webhook] {token} ({token_name}) → Score {score} at {timestamp}")
