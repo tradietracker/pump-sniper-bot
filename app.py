@@ -1,88 +1,122 @@
 import os
-import requests
 from flask import Flask, request, jsonify
-from datetime import datetime
-import json
+import requests
+
+# === CONFIG ===
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8002496896:AAHVVGnUTP_d7Gpz_7nS7L9kNNr9SgcJ__0"
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "6558366634"
+PUMP_SCORE_THRESHOLD = 16
+REMOVE_SCORE_THRESHOLD = 8
 
 app = Flask(__name__)
 
-# === CONFIG ===
-TELEGRAM_BOT_TOKEN = "8002496896:AAHVVGnUTP_d7Gpz_7nS7L9kNNr9SgcJ__0"
-TELEGRAM_CHAT_ID = "6558366634"
-HELIUS_API_KEY = "e61c01b8-8e60-4c29-8144-559953796a62"  # Your updated key here
-ALERTED_TOKENS = {}
-
-# === UTILS ===
-def get_token_name(mint_address):
-    try:
-        url = f"https://api.helius.xyz/v0/token-metadata?api-key={HELIUS_API_KEY}"
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "mintAccounts": [mint_address]
-        }
-        response = requests.post(url, headers=headers, data=json.dumps(payload))
-        result = response.json()
-        name = result[0]["onChainMetadata"]["metadata"]["name"]
-        return name
-    except Exception:
-        return mint_address  # fallback
-
-def build_pump_gauge(score):
-    filled = "🟩" * score
-    empty = "⬜️" * (10 - score)
-    return f"{filled}{empty} ({score}/10)"
-
-def send_telegram_alert(token_address, pump_score, token_name):
-    text = f"🚀 *Pump Score {pump_score} detected!*\n\n"
-    text += f"*Token:* `{token_address}`\n"
-    text += f"*Name:* {token_name}\n"
-    text += f"*Pump Strength:*\n{build_pump_gauge(pump_score)}\n"
-    text += "_Live gauge updates will follow..._"
+# === TELEGRAM ALERT ===
+def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    requests.post(url, json=payload)
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
 
-def send_gauge_update(token_address, pump_score):
-    token_name = get_token_name(token_address)
-    message = f"📈 *Pump Score Update*\n\n"
-    message += f"*Name:* {token_name}\n"
-    message += f"*Strength:* {build_pump_gauge(pump_score)}"
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    requests.post(url, json=payload)
+# === PUMP SCORE ENGINE ===
+def calculate_pump_score(data):
+    score = 0
 
-# === ROUTES ===
-@app.route("/")
-def index():
-    return "Pump Sniper Bot Live ✅"
+    # 1. Top Holder %
+    score += 2 if 15 <= data['top_holder_pct'] <= 30 else 1 if 10 <= data['top_holder_pct'] < 15 or 30 < data['top_holder_pct'] <= 35 else 0
 
-@app.route("/helfire", methods=["POST"])
-def handle_webhook():
+    # 2. Dev Wallet %
+    score += 2 if data['dev_wallet_pct'] <= 2 else 1 if data['dev_wallet_pct'] <= 5 else 0
+
+    # 3. Sniper / Insider %
+    score += 2 if data['sniper_pct'] <= 5 else 1 if data['sniper_pct'] <= 10 else 0
+
+    # 4. Recovery Duration
+    score += 2 if 2 <= data['recovery_duration_hrs'] <= 12 else 1 if 1 <= data['recovery_duration_hrs'] < 2 or 12 < data['recovery_duration_hrs'] <= 24 else 0
+
+    # 5. Buy Spike (5min)
+    net_volume = data['buy_volume'] - data['sell_volume']
+    if net_volume >= 5 and data['unique_buyers'] >= 5:
+        score += 4
+    elif net_volume >= 2 and data['unique_buyers'] >= 3:
+        score += 2
+
+    # 6. LP %
+    score += 2 if 5 <= data['lp_pct'] <= 10 else 1 if 3 <= data['lp_pct'] < 5 or 10 < data['lp_pct'] <= 12 else 0
+
+    # 7. MC:LP Ratio
+    score += 2 if 8 <= data['mc_to_liquidity_ratio'] <= 14 else 1 if 5 <= data['mc_to_liquidity_ratio'] < 8 or 14 < data['mc_to_liquidity_ratio'] <= 20 else 0
+
+    # 8. Holder Growth
+    score += 4 if data['holder_growth'] >= 10 else 2 if data['holder_growth'] >= 5 else 0
+
+    # 9. CPW
+    score += 4 if data['cpw_score'] >= 2 else 2 if data['cpw_score'] == 1 else 0
+
+    return min(score, 24)
+
+# === FORMAT ALERT ===
+def format_alert(data, score):
+    if score >= 16:
+        color = "🟢 *STRONG SIGNAL*"
+    elif score >= 10:
+        color = "🟡 *WARMING UP*"
+    else:
+        color = "🔴 *WEAK / FADING*"
+
+    return f"""{color}
+*Pump Score: {score}/24*
+
+Token: `{data['token_name']}`
+Price: {data['price']}
+
+📈 Buy Volume: {data['buy_volume']} | Buyers: {data['unique_buyers']}
+📉 Sell Volume: {data['sell_volume']} | Sellers: {data['unique_sellers']}
+
+👑 Top Holder %: {data['top_holder_pct']}%
+🧬 Dev Wallet %: {data['dev_wallet_pct']}%
+🎯 Sniper %: {data['sniper_pct']}%
+🧪 LP %: {data['lp_pct']}%
+⚖️ MC/LP Ratio: {data['mc_to_liquidity_ratio']}
+👥 Holder Growth: {data['holder_growth']}
+📢 CPW Score: {data['cpw_score']}
+⏳ Recovery Duration: {data['recovery_duration_hrs']}h
+"""
+
+# === WEBHOOK ===
+@app.route('/helfire', methods=['POST'])
+def helfire():
     data = request.get_json()
-    token = data.get("token_address")
-    score = data.get("pump_score")
-    timestamp = data.get("timestamp")
 
-    if not token or not score:
-        return jsonify({"error": "Missing fields"}), 400
+    if not data:
+        return jsonify({"error": "No JSON received"}), 400
 
-    token_name = get_token_name(token)
+    required = [
+        "token_address", "token_name", "price",
+        "buy_volume", "sell_volume", "unique_buyers", "unique_sellers",
+        "top_holder_pct", "dev_wallet_pct", "sniper_pct",
+        "lp_pct", "mc_to_liquidity_ratio", "holder_growth",
+        "cpw_score", "recovery_duration_hrs"
+    ]
 
-    # Avoid duplicate alerts
-    if token not in ALERTED_TOKENS or ALERTED_TOKENS[token] != score:
-        ALERTED_TOKENS[token] = score
-        if score >= 7:
-            send_telegram_alert(token, score, token_name)
-        else:
-            send_gauge_update(token, score)
+    missing = [field for field in required if field not in data]
+    if missing:
+        return jsonify({
+            "error": "Missing fields",
+            "missing": missing,
+            "received_keys": list(data.keys())
+        }), 400
 
-    print(f"[Webhook] {token} ({token_name}) → Score {score} at {timestamp}")
-    return jsonify({"status": "ok"}), 200
+    score = calculate_pump_score(data)
+
+    if score >= PUMP_SCORE_THRESHOLD:
+        alert = format_alert(data, score)
+        send_telegram_alert(alert)
+
+    return jsonify({"status": "scored", "pump_score": score}), 200
+
+# === PING ===
+@app.route('/')
+def index():
+    return "Pump Sniper Bot is live!", 200
+
+# === MAIN ===
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
