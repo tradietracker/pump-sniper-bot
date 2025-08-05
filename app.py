@@ -65,7 +65,7 @@ def format_alert(data, score):
 *Pump Score: {score}/24*
 
 Token: `{data['token_name']}`
-Price: {data['price']}
+Market Cap: {data['market_cap']}
 
 📈 Buy Volume: {data['buy_volume']} | Buyers: {data['unique_buyers']}
 📉 Sell Volume: {data['sell_volume']} | Sellers: {data['unique_sellers']}
@@ -89,7 +89,7 @@ def helfire():
         return jsonify({"error": "No JSON received"}), 400
 
     required = [
-        "token_address", "token_name", "price",
+        "token_address", "token_name", "market_cap",
         "buy_volume", "sell_volume", "unique_buyers", "unique_sellers",
         "top_holder_pct", "dev_wallet_pct", "sniper_pct",
         "lp_pct", "mc_to_liquidity_ratio", "holder_growth",
