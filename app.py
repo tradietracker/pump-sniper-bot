@@ -10,10 +10,57 @@ REMOVE_SCORE_THRESHOLD = 8
 
 app = Flask(__name__)
 
+# In-memory store: token_address -> telegram message_id
+alerted_tokens = {}
+
 # === TELEGRAM ALERT ===
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
+    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True})
+    if resp.status_code == 200:
+        return resp.json()['result']['message_id']
+    else:
+        print(f"Telegram sendMessage error: {resp.text}")
+        return None
+
+def edit_telegram_message(message_id, new_text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "message_id": message_id,
+        "text": new_text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    resp = requests.post(url, json=payload)
+    if resp.status_code != 200:
+        print(f"Telegram editMessageText error: {resp.text}")
+
+# === HELPER: Format large numbers ===
+def human_format(num):
+    try:
+        num = float(num)
+    except (ValueError, TypeError):
+        return "N/A"
+    magnitude = 0
+    while abs(num) >= 1000 and magnitude < 4:
+        magnitude += 1
+        num /= 1000.0
+    suffixes = ['', 'K', 'M', 'B', 'T']
+    return f"${num:.2f}{suffixes[magnitude]}"
+
+# === HELPER: Gradient color gauge bar ===
+def create_gauge_bar(score, max_score=24, length=10):
+    gradient_blocks = ["🟥", "🟥", "🟧", "🟧", "🟨", "🟨", "🟩", "🟩", "🟩", "🟩"]
+    filled_blocks = int(round(score / max_score * length))
+    bar = []
+
+    for i in range(length):
+        if i < filled_blocks:
+            bar.append(gradient_blocks[i])
+        else:
+            bar.append("⬜️")
+    return "".join(bar)
 
 # === PUMP SCORE ENGINE ===
 def calculate_pump_score(data):
@@ -52,9 +99,13 @@ def calculate_pump_score(data):
 
     return min(score, 24)
 
-# === FORMAT ALERT ===
+# === FORMAT ALERT with live gauge ===
 def format_alert(data, score):
-    if score >= 16:
+    market_cap_str = human_format(data['market_cap'])
+    axiom_link = f"https://axiom.trade/meme/{data['token_address']}"
+    gauge = create_gauge_bar(score)
+
+    if score >= PUMP_SCORE_THRESHOLD:
         color = "🟢 *STRONG SIGNAL*"
     elif score >= 10:
         color = "🟡 *WARMING UP*"
@@ -65,7 +116,11 @@ def format_alert(data, score):
 *Pump Score: {score}/24*
 
 Token: `{data['token_name']}`
-Market Cap: {data['market_cap']}
+Market Cap: {market_cap_str}
+[View Chart on Axiom](<{axiom_link}>)
+
+Pump Strength:
+{gauge} ({score}/24)
 
 📈 Buy Volume: {data['buy_volume']} | Buyers: {data['unique_buyers']}
 📉 Sell Volume: {data['sell_volume']} | Sellers: {data['unique_sellers']}
@@ -105,10 +160,23 @@ def helfire():
         }), 400
 
     score = calculate_pump_score(data)
+    token_address = data['token_address']
+    message_id = alerted_tokens.get(token_address)
 
     if score >= PUMP_SCORE_THRESHOLD:
-        alert = format_alert(data, score)
-        send_telegram_alert(alert)
+        alert_text = format_alert(data, score)
+        if message_id:
+            edit_telegram_message(message_id, alert_text)
+        else:
+            message_id = send_telegram_alert(alert_text)
+            if message_id:
+                alerted_tokens[token_address] = message_id
+    else:
+        # If score below remove threshold, fade alert
+        if message_id:
+            faded_text = f"⚠️ *Alert faded* for `{data['token_name']}` (Pump Score dropped to {score}/24)"
+            edit_telegram_message(message_id, faded_text)
+            alerted_tokens.pop(token_address, None)
 
     return jsonify({"status": "scored", "pump_score": score}), 200
 
