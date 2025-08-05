@@ -84,6 +84,10 @@ Price: {data['price']}
 @app.route('/helfire', methods=['POST'])
 def helfire():
     data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "No JSON received"}), 400
+
     required = [
         "token_address", "token_name", "price",
         "buy_volume", "sell_volume", "unique_buyers", "unique_sellers",
@@ -91,9 +95,14 @@ def helfire():
         "lp_pct", "mc_to_liquidity_ratio", "holder_growth",
         "cpw_score", "recovery_duration_hrs"
     ]
+
     missing = [field for field in required if field not in data]
     if missing:
-        return jsonify({"error": "Missing fields", "missing": missing}), 400
+        return jsonify({
+            "error": "Missing fields",
+            "missing": missing,
+            "received_keys": list(data.keys())
+        }), 400
 
     score = calculate_pump_score(data)
     if score >= PUMP_SCORE_THRESHOLD:
